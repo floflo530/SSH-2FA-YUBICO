@@ -26,6 +26,6 @@ Il s’appuie sur **libpam-oath** et un code TOTP généré dans **Yubico Authen
 ## 📥 Installation
 
 ```bash
-wget https://raw.githubusercontent.com/<VOTRE_USER>/<VOTRE_REPO>/main/setup-ssh-2fa-oath.sh -O /root/setup-ssh-2fa-oath.sh
+wget https://raw.githubusercontent.com/floflo530/SSH-2FA-YUBICO/refs/heads/main/setup-ssh-2fa-oath.sh -O /root/setup-ssh-2fa-oath.sh
 chmod +x /root/setup-ssh-2fa-oath.sh
 /root/setup-ssh-2fa-oath.sh
