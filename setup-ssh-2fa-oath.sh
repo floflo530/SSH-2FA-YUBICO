@@ -4,41 +4,67 @@
 #   1) Installer/activer le 2FA
 #   2) Supprimer/revenir à la config de base
 #   3) Diagnostic (heure NTP, TOTP serveur, conf PAM/SSH, logs)
+#   4) Activer/Désactiver le debug pam_oath
 # A lancer en root. Sauvegardes automatiques *.bak.YYYYmmdd-HHMMSS
 
 set -euo pipefail
 
-# ---------- Couleurs (compatibles printf) ----------
-CE=$'\033[0;36m'   # Cyan
-GR=$'\033[0;32m'   # Vert
-YE=$'\033[1;33m'   # Jaune
-RD=$'\033[0;31m'   # Rouge
-NC=$'\033[0m'      # Reset
-
+# ---------- Couleurs ----------
+CE=$'\033[0;36m'; GR=$'\033[0;32m'; YE=$'\033[1;33m'; RD=$'\033[0;31m'; NC=$'\033[0m'
 info(){ printf "%b==>%b %s\n" "$CE" "$NC" "$*"; }
 ok(){   printf "%b[OK]%b %s\n" "$GR" "$NC" "$*"; }
 warn(){ printf "%b[! ]%b %s\n" "$YE" "$NC" "$*"; }
 err(){  printf "%b[ERREUR]%b %s\n" "$RD" "$NC" "$*"; }
 ask(){  read -r -p "$(printf "%b?%b %s " "$YE" "$NC" "$*")" REPLY_ASK; }
-
 require_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || { err "Lance ce script en root."; exit 1; }; }
 
-backup_file(){
-  local f="$1"; [[ -f "$f" ]] || return 0
-  local ts; ts="$(date +%Y%m%d-%H%M%S)"
-  cp -a "$f" "${f}.bak.${ts}"
-  ok "Sauvegarde : ${f}.bak.${ts}"
+backup_file(){ local f="$1"; [[ -f "$f" ]] || return 0; local ts; ts="$(date +%Y%m%d-%H%M%S)"; cp -a "$f" "${f}.bak.${ts}"; ok "Sauvegarde : ${f}.bak.${ts}"; }
+latest_backup(){ ls -1t "$1".bak.* 2>/dev/null | head -n1 || true; }
+set_conf_value(){ local file="$1" key="$2" val="$3"; if grep -Eq "^[#[:space:]]*${key}\b" "$file"; then sed -i "s|^[#[:space:]]*${key}\b.*|${key} ${val}|" "$file"; else printf "%s %s\n" "$key" "$val" >> "$file"; fi; }
+
+# --- Réécriture SÛRE de /etc/pam.d/sshd (pas de numéros, pas de doublons, ordre OK) ---
+rewrite_pam_sshd(){
+  local window="$1" digits="$2"
+  local pam="/etc/pam.d/sshd"
+  backup_file "$pam"
+
+  # Copie propre sans pam_oath ni lignes numériques orphelines
+  local tmp_rest; tmp_rest="$(mktemp)"
+  sed '/pam_oath\.so/d' "$pam" | sed '/^[[:space:]]*[0-9][0-9]*[[:space:]]*$/d' > "$tmp_rest"
+
+  # Marqueur pour raccrocher le reste (Debian)
+  local start
+  start="$(awk '/^# Disallow non-root logins when \/etc\/nologin exists\./{print NR; exit}' "$tmp_rest")"
+  [[ -z "$start" ]] && start="$(awk '/^[[:space:]]*account[[:space:]]/{print NR; exit}' "$tmp_rest")"
+  [[ -z "$start" ]] && start=5
+
+  {
+    echo "# PAM configuration for the Secure Shell service"
+    echo
+    echo "# Auth : mot de passe via common-auth, puis OTP via pam_oath"
+    echo "@include common-auth"
+    echo "auth required pam_oath.so usersfile=/etc/users.oath window=${window} digits=${digits}"
+    echo
+    tail -n +"$start" "$tmp_rest"
+  } > "${pam}.new"
+
+  mv "${pam}.new" "$pam"
+  rm -f "$tmp_rest"
+  ok "PAM configuré (password → OTP), sans doublons ni numérotation parasite."
 }
 
-latest_backup(){ ls -1t "$1".bak.* 2>/dev/null | head -n1 || true; }
-
-set_conf_value(){
-  local file="$1" key="$2" val="$3"
-  if grep -Eq "^[#[:space:]]*${key}\b" "$file"; then
-    sed -i "s|^[#[:space:]]*${key}\b.*|${key} ${val}|" "$file"
+# --- Activer / désactiver le flag debug sur la ligne pam_oath ---
+toggle_debug_pam_oath(){
+  local pam="/etc/pam.d/sshd"
+  backup_file "$pam"
+  if grep -qE 'pam_oath\.so .*debug' "$pam"; then
+    sed -i 's/\(pam_oath\.so [^#]*\) *\bdebug\b/\1/' "$pam"
+    ok "Debug pam_oath : désactivé"
   else
-    printf "%s %s\n" "$key" "$val" >> "$file"
+    sed -i 's|\(pam_oath\.so [^#]*\)|\1 debug|' "$pam"
+    ok "Debug pam_oath : activé"
   fi
+  systemctl restart ssh
 }
 
 # ---------- 1) Installer / activer 2FA ----------
@@ -80,12 +106,10 @@ PY
   info "Mise à jour /etc/users.oath"
   touch /etc/users.oath && chmod 600 /etc/users.oath && chown root:root /etc/users.oath
   backup_file /etc/users.oath
-  # Supprime l’ancienne ligne éventuelle pour cet utilisateur (même format)
   sed -i "\|^[[:space:]]*HOTP/T30/${DIGITS}[[:space:]]\+${SSH_USER}[[:space:]]\+-[[:space:]]\+[0-9a-fA-F]\+|d" /etc/users.oath
   echo "HOTP/T30/${DIGITS} ${SSH_USER} - ${SECRET_HEX}" >> /etc/users.oath
   ok "Ajouté pour ${SSH_USER}"
 
-  # Bloc d’instructions lisible avec couleurs fiables
   printf "%b=== Étape à faire dans Yubico Authenticator ===%b\n" "$YE" "$NC"
   printf "  1) Ouvrez %bYubico Authenticator%b.\n" "$GR" "$NC"
   printf "  2) Cliquez sur %b+%b → %bTOTP%b.\n" "$GR" "$NC" "$GR" "$NC"
@@ -96,7 +120,6 @@ PY
     printf "  4) Secret (Base32) : %b(votre secret existant)%b\n" "$GR" "$NC"
   fi
   printf "  5) Chiffres : %b6%b | Période : %b30s%b\n" "$GR" "$NC" "$GR" "$NC"
-  printf "Enregistrez, puis revenez ici.\n"
   read -r -p "Appuyez sur Entrée quand c'est fait..." _
 
   info "Vérification TOTP côté serveur"
@@ -107,16 +130,7 @@ PY
   ok "TOTP OK"
 
   info "Configuration de PAM (/etc/pam.d/sshd)"
-  backup_file /etc/pam.d/sshd
-  # Nettoyage doublons puis entête propre: mot de passe -> OTP
-  sed -i '/pam_oath\.so/d' /etc/pam.d/sshd
-  {
-    echo "@include common-auth"
-    echo "auth required pam_oath.so usersfile=/etc/users.oath window=${WINDOW} digits=${DIGITS}"
-    # Conserver le reste du fichier à partir de la ligne 5 (évite doublons)
-    nl -ba /etc/pam.d/sshd | awk 'NR>=5{print substr($0,index($0,$2))}'
-  } > /etc/pam.d/sshd.new && mv /etc/pam.d/sshd.new /etc/pam.d/sshd
-  ok "PAM configuré (mot de passe puis OTP)."
+  rewrite_pam_sshd "$WINDOW" "$DIGITS"
 
   info "Configuration SSH (/etc/ssh/sshd_config)"
   backup_file /etc/ssh/sshd_config
@@ -207,7 +221,7 @@ diag_2fa(){
   echo
 
   info "Début de /etc/pam.d/sshd"
-  sed -n '1,20p' /etc/pam.d/sshd 2>/dev/null || true
+  sed -n '1,30p' /etc/pam.d/sshd 2>/dev/null || true
   echo
 
   info "Recherche de doublons pam_oath / common-auth"
@@ -231,16 +245,25 @@ diag_2fa(){
   ok "Diagnostic terminé."
 }
 
+# ---------- 4) Activer/Désactiver le debug pam_oath ----------
+debug_pam(){
+  toggle_debug_pam_oath
+  printf "%bAstuce :%b refaites un essai de connexion puis consultez :\n" "$YE" "$NC"
+  printf "  journalctl -u ssh --since \"3 minutes ago\" --no-pager | egrep -i 'oath|pam|sshd|keyboard|auth'\n"
+}
+
 # ---------- Main ----------
 require_root
 printf "%bGestion du 2FA SSH (mot de passe + OTP OATH via Yubico Authenticator)%b\n" "$CE" "$NC"
 printf "1) Installer/activer le 2FA\n"
 printf "2) Supprimer/revenir à la config de base\n"
 printf "3) Diagnostic\n"
-read -r -p "Choisissez [1/2/3] : " CHOIX
+printf "4) Activer/Désactiver le debug pam_oath\n"
+read -r -p "Choisissez [1/2/3/4] : " CHOIX
 case "${CHOIX:-}" in
   1) install_2fa ;;
   2) revert_2fa ;;
   3) diag_2fa ;;
+  4) debug_pam ;;
   *) err "Choix invalide." ; exit 1 ;;
 esac
